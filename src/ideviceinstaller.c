@@ -1,8 +1,8 @@
 /*
  * ideviceinstaller - Manage apps on iOS devices.
  *
+ * Copyright (C) 2010-2019 Nikias Bassen <nikias@gmx.li>
  * Copyright (C) 2010-2015 Martin Szulecki <m.szulecki@libimobiledevice.org>
- * Copyright (C) 2010-2014 Nikias Bassen <nikias@gmx.li>
  *
  * Licensed under the GNU General Public License Version 2
  *
@@ -51,6 +51,39 @@
 
 #include <zip.h>
 
+#ifdef WIN32
+#include <windows.h>
+#define wait_ms(x) Sleep(x)
+#else
+#define wait_ms(x) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = x * 1000000; nanosleep(&ts, NULL); }
+#endif
+
+#ifndef HAVE_VASPRINTF
+static int vasprintf(char **PTR, const char *TEMPLATE, va_list AP)
+{
+	int res;
+	char buf[16];
+	res = vsnprintf(buf, 16, TEMPLATE, AP);
+	if (res > 0) {
+		*PTR = (char*)malloc(res+1);
+		res = vsnprintf(*PTR, res+1, TEMPLATE, AP);
+	}
+	return res;
+}
+#endif
+
+#ifndef HAVE_ASPRINTF
+static int asprintf(char **PTR, const char *TEMPLATE, ...)
+{
+	int res;
+	va_list AP;
+	va_start(AP, TEMPLATE);
+	res = vasprintf(PTR, TEMPLATE, AP);
+	va_end(AP);
+	return res;
+}
+#endif
+
 #define ITUNES_METADATA_PLIST_FILENAME "iTunesMetadata.plist"
 
 const char PKG_PATH[] = "PublicStaging";
@@ -76,6 +109,7 @@ int cmd = CMD_NONE;
 
 char *last_status = NULL;
 int wait_for_command_complete = 0;
+int use_notifier = 0;
 int notification_expected = 0;
 int is_device_connected = 0;
 int command_completed = 0;
@@ -323,9 +357,6 @@ static void idevice_event_callback(const idevice_event_t* event, void* userdata)
 
 static void idevice_wait_for_command_to_complete()
 {
-	struct timespec ts;
-	ts.tv_sec = 0;
-	ts.tv_nsec = 50000000;
 	is_device_connected = 1;
 
 	/* subscribe to make sure to exit on device removal */
@@ -333,13 +364,13 @@ static void idevice_wait_for_command_to_complete()
 
 	/* wait for command to complete */
 	while (wait_for_command_complete && !command_completed && !err_occurred
-		   && !notified && is_device_connected) {
-		nanosleep(&ts, NULL);
+		   && is_device_connected) {
+		wait_ms(50);
 	}
 
 	/* wait some time if a notification is expected */
-	while (notification_expected && !notified && !err_occurred && is_device_connected) {
-		nanosleep(&ts, NULL);
+	while (use_notifier && notification_expected && !notified && !err_occurred && is_device_connected) {
+		wait_ms(50);
 	}
 
 	idevice_event_unsubscribe();
@@ -374,6 +405,8 @@ static void print_usage(int argc, char **argv)
 		 "  -r, --restore APPID\tRestore archived app specified by APPID\n"
 		 "  -R, --remove-archive APPID  Remove app archive specified by APPID\n"
 		 "  -o, --options\t\tPass additional options to the specified command.\n"
+		 "  -n, --notify-wait\t\tWait for app installed/uninstalled notification\n"
+		 "                    \t\tto before reporting success of operation\n"
 		 "  -h, --help\t\tprints usage information\n"
 		 "  -d, --debug\t\tenable communication debugging\n" "\n");
 	printf("Homepage: <http://libimobiledevice.org>\n");
@@ -382,24 +415,25 @@ static void print_usage(int argc, char **argv)
 static void parse_opts(int argc, char **argv)
 {
 	static struct option longopts[] = {
-		{"help", 0, NULL, 'h'},
-		{"udid", 1, NULL, 'u'},
-		{"list-apps", 0, NULL, 'l'},
-		{"install", 1, NULL, 'i'},
-		{"uninstall", 1, NULL, 'U'},
-		{"upgrade", 1, NULL, 'g'},
-		{"list-archives", 0, NULL, 'L'},
-		{"archive", 1, NULL, 'a'},
-		{"restore", 1, NULL, 'r'},
-		{"remove-archive", 1, NULL, 'R'},
-		{"options", 1, NULL, 'o'},
-		{"debug", 0, NULL, 'd'},
-		{NULL, 0, NULL, 0}
+		{ "help", no_argument, NULL, 'h' },
+		{ "udid", required_argument, NULL, 'u' },
+		{ "list-apps", no_argument, NULL, 'l' },
+		{ "install", required_argument, NULL, 'i' },
+		{ "uninstall", required_argument, NULL, 'U' },
+		{ "upgrade", required_argument, NULL, 'g' },
+		{ "list-archives", no_argument, NULL, 'L' },
+		{ "archive", required_argument, NULL, 'a' },
+		{ "restore", required_argument, NULL, 'r' },
+		{ "remove-archive", required_argument, NULL, 'R' },
+		{ "options", required_argument, NULL, 'o' },
+		{ "notify-wait", no_argument, NULL, 'n' },
+		{ "debug", no_argument, NULL, 'd' },
+		{ NULL, 0, NULL, 0 }
 	};
 	int c;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hU:li:u:g:La:r:R:o:d", longopts,
+		c = getopt_long(argc, argv, "hU:li:u:g:La:r:R:o:nd", longopts,
 						(int *) 0);
 		if (c == -1) {
 			break;
@@ -478,6 +512,9 @@ static void parse_opts(int argc, char **argv)
 				options = newopts;
 			}
 			break;
+		case 'n':
+			use_notifier = 1;
+			break;
 		case 'd':
 			idevice_set_debug_level(1);
 			break;
@@ -530,7 +567,7 @@ static int afc_upload_file(afc_client_t afc, const char* filename, const char* d
 				total += written;
 			}
 			if (total != amount) {
-				fprintf(stderr, "Error: wrote only %d of %zu\n", total, amount);
+				fprintf(stderr, "Error: wrote only %u of %u\n", total, (uint32_t)amount);
 				afc_file_close(afc, af);
 				fclose(f);
 				return -1;
@@ -624,33 +661,35 @@ int main(int argc, char **argv)
 		goto leave_cleanup;
 	}
 
-	if ((lockdownd_start_service
-		 (client, "com.apple.mobile.notification_proxy",
-		  &service) != LOCKDOWN_E_SUCCESS) || !service) {
-		fprintf(stderr,
-				"Could not start com.apple.mobile.notification_proxy!\n");
-		res = -1;
-		goto leave_cleanup;
+	if (use_notifier) {
+		if ((lockdownd_start_service
+			 (client, "com.apple.mobile.notification_proxy",
+			  &service) != LOCKDOWN_E_SUCCESS) || !service) {
+			fprintf(stderr,
+					"Could not start com.apple.mobile.notification_proxy!\n");
+			res = -1;
+			goto leave_cleanup;
+		}
+
+		np_error_t nperr = np_client_new(device, service, &np);
+
+		if (service) {
+			lockdownd_service_descriptor_free(service);
+		}
+		service = NULL;
+
+		if (nperr != NP_E_SUCCESS) {
+			fprintf(stderr, "Could not connect to notification_proxy!\n");
+			res = -1;
+			goto leave_cleanup;
+		}
+
+		np_set_notify_callback(np, notifier, NULL);
+
+		const char *noties[3] = { NP_APP_INSTALLED, NP_APP_UNINSTALLED, NULL };
+
+		np_observe_notifications(np, noties);
 	}
-
-	np_error_t nperr = np_client_new(device, service, &np);
-
-	if (service) {
-		lockdownd_service_descriptor_free(service);
-	}
-	service = NULL;
-
-	if (nperr != NP_E_SUCCESS) {
-		fprintf(stderr, "Could not connect to notification_proxy!\n");
-		res = -1;
-		goto leave_cleanup;
-	}
-
-	np_set_notify_callback(np, notifier, NULL);
-
-	const char *noties[3] = { NP_APP_INSTALLED, NP_APP_UNINSTALLED, NULL };
-
-	np_observe_notifications(np, noties);
 
 run_again:
 	if (service) {
@@ -926,7 +965,7 @@ run_again:
 			/* extract the CFBundleIdentifier from the package */
 
 			/* construct full filename to Info.plist */
-			char *filename = (char*)malloc(strlen(appid)+10+1);
+			char *filename = (char*)malloc(strlen(appid)+11+1);
 			strcpy(filename, appid);
 			strcat(filename, "/Info.plist");
 
@@ -943,7 +982,7 @@ run_again:
 			char *ibuf = malloc(filesize * sizeof(char));
 			size_t amount = fread(ibuf, 1, filesize, fp);
 			if (amount != filesize) {
-				fprintf(stderr, "ERROR: could not read %ld bytes from %s\n", filesize, filename);
+				fprintf(stderr, "ERROR: could not read %u bytes from %s\n", (uint32_t)filesize, filename);
 				free(filename);
 				res = -1;
 				goto leave_cleanup;
